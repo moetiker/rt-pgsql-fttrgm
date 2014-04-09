@@ -1,0 +1,13 @@
+diff --git a/local/lib/RT/Tickets.pm b/local/lib/RT/Tickets.pm
+index 140e09d..fe5f80c 100644
+--- a/local/lib/RT/Tickets.pm
++++ b/local/lib/RT/Tickets.pm
+@@ -926,7 +926,7 @@ sub _TransContentLimit {
+                 ALIAS       => $alias,
+                 FIELD       => $index,
+                 OPERATOR    => '@@',
+-                VALUE       => 'plainto_tsquery('. $dbh->quote($value) .')',
++                VALUE       => 'text_to_trgm_tsquery('. $dbh->quote($value) .')',
+                 QUOTEVALUE  => 0,
+             );
+         }

@@ -1,0 +1,44 @@
+
+    Request Tracker with PostgreSQL database backend
+	    and FullText based on trigrams
+    ================================================
+
+This is an experimental modification inspired by
+http://kaiv.wordpress.com/2007/12/11/postgresql-substring-search/
+I'm testing this with RT version 4.2.3.
+
+The modification described further solves the need to be able to search
+for substrings and not only whole words or other Pg FT parser tokens using
+full-text PostgreSQL. For example if the ticket body contains
+
+   The URL http://www.cisco.com/...
+   ...code of the function  FooBarSample()...
+
+and want to search the word "cisco" you need this. If you want search for
+substring "foo" or "bar" etc you need this...
+
+You need to proceed following steps:
+
+ * Setup indexes on trigrams in the database. This can be achieved using the
+   script rt-mysql2pg:
+
+	rt-mysql2pg -v --dst-dsn dbi:Pg:dbname=rt4 --fulltext --vacuum
+
+ * Patch the RT/Tickets.pm copy
+
+	cd /opt/rt4	    # or where your RT instalation root is
+	cp lib/RT/Tickets.pm local/lib/RT/Tickets.pm 
+	patch -p1 < patch-to-patch/rt-pgsql-fttrgm.patch
+
+ * Enable FullTextSearch in the RT_SiteConfig.pm
+ 
+	Set(%FullTextSearch,
+	    Enable     => 1,
+	    Indexed    => 1,
+	    Column     => 'trigrams',
+	    Table      => 'Attachments',
+	);
+
+You are able to search for substrings (at least 3 characters long).
+
+ -- Wed, 09 Apr 2014 22:57:24 +0200  Václav Ovsík <vaclav.ovsik@i.cz>

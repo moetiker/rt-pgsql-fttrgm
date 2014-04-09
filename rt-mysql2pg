@@ -1,0 +1,735 @@
+#!/usr/bin/env perl
+use strict;
+use DBI;
+use Data::Dumper;
+use DBD::Pg qw(PG_BYTEA);
+use Encode qw(is_utf8);
+use Encode::Guess qw(utf8 latin2 ascii);
+use File::LibMagic;
+use Getopt::Long;
+use MIME::Base64 qw(encode_base64);
+
+my $version='1.0';
+
+my ($verbose, $dryrun);
+
+my $tsvector_column = 'trigrams';
+
+my $flm = File::LibMagic->new();
+
+sub usage
+{
+    my ($exitcode) = @_;
+    print STDERR <<EOF;
+rt-mysql2pg [options]
+
+Version: $version
+
+Converts Request Tracker database from MySQL to PostgreSQL
+
+Do a copy of every record in user tables from a source database to
+a destination database. A destination schema must exists (same as source
+schema), so inserts can be done without error. Tables in destination database
+are deleted before doing a copy!
+
+options:
+
+ -c,--copy		    copy data, --src-dsn & --dst-dsn must be present
+
+    --[no]fulltext	    setup/remove fulltext support, --dst-dsn must be
+			    present, can be combined with --copy
+
+    --src-dsn dsn	    perl DBI data source name (e.g. dbi:mysql:dbname=rt3)
+    --src-user user	    perl DBI user name
+    --src-password pass	    perl DBI password
+
+    --dst-dsn dsn	    perl DBI data source name (e.g. dbi:Pg:dbname=rt3)
+    --dst-user user	    perl DBI user name
+    --dst-password pass	    perl DBI password
+
+ -n,--dry-run		    dry run (no db modifications)
+
+ -v,--verbose		    run verbosly (incremental)
+ -h,--help		    help usage
+
+EOF
+    exit($exitcode) if defined $exitcode;
+}
+
+sub user_tables
+{
+    my ($dbh) = @_;
+    my $sth = $dbh->table_info(undef, undef, undef, 'TABLE');
+    $sth->execute();
+    my @user_tables;
+    while ( my $r = $sth->fetchrow_arrayref() )
+    {
+	my ($table_cat, $table_schem, $table_name, $table_type, $remarks) = @$r;
+	next unless $table_type eq 'TABLE';
+	next if $dbh->{Driver}->{Name} eq 'Pg' && $table_schem ne 'public';
+	push @user_tables, $table_name;
+    }
+    return \@user_tables;
+}
+
+sub user_seqs
+{
+    my ($dbh) = @_;
+    return $dbh->selectcol_arrayref('SELECT sequence_name FROM information_schema.sequences');
+}
+
+sub column_info
+{
+    my ($dbh, $table) = @_;
+    my $schema = $dbh->{Driver}->{Name} eq 'Pg' ? 'public' : undef;
+    my $sth = $dbh->column_info(undef, $schema, $table, undef);
+    $sth->execute();
+    my (@coln, %colt);
+    while ( my $r = $sth->fetchrow_arrayref() )
+    {
+	my ($table_cat, $table_schem, $table_name, $column_name, $data_type,
+		$type_name, $column_size, $buffer_length, $decimal_digits,
+		$num_prec_radix, $nullable, $remarks, $column_def,
+		$sql_data_type, $sql_datetime_sub, $char_octet_length,
+		$ordinal_position, $is_nullable, $type_name_and_size) = @$r;
+	push @coln, lc($column_name);
+	$colt{lc($column_name)} = {
+		'data_type' => $data_type,
+		'type_name' => lc($type_name),
+		'type_name_and_size' => lc($type_name_and_size),
+	};
+    }
+    return (\@coln, \%colt);
+}
+
+sub utf8_fix
+{
+    my $s = $_[0];
+    return 0 if !defined $s || $s eq '';
+    $s =~ s/\x0+$//;
+    my $decoder = Encode::Guess->guess($s);
+    if ( defined($decoder) )
+    {
+	if ( ref($decoder) )
+	{
+	    return 0 if $decoder->name eq 'ascii' || $decoder->name eq 'utf8';
+	    $s = $decoder->decode($s);
+	    return -1 unless Encode::is_utf8($s, 1);
+	}
+	elsif ($decoder =~ /(\S+ or .+)/)
+	{
+            my %matched = map { $_ => 1 } split(/ or /, $1);
+	    if ( $matched{'utf8'} )
+	    {
+		$s = Encode::decode('utf-8', $s, Encode::FB_DEFAULT);
+		return -1 unless Encode::is_utf8($s, 1);
+	    }
+	    else
+	    {
+		die "Multiple charsets? $decoder\n";
+	    }
+        }
+	elsif ($decoder =~ m/No appropriate encodings found!/ )
+	{
+	    die "No appropriate encodings found!\n";
+	}
+	else
+	{
+	    die "What? $decoder\n";
+	}
+	$_[0] = $s;
+    }
+    return 0;
+}
+
+sub conttype_guess
+{
+    my ($data) = @_;
+    return undef if $data eq '';
+    my $conttype_guess = $data ? $flm->checktype_contents($data) : '';
+    $conttype_guess =~ s/;.*//;
+    return $conttype_guess if $conttype_guess =~ m{^[-.a-z0-9]+/[-.a-z0-9]+};
+    return undef;
+}
+
+sub copy_table
+{
+    my ($table, $dbh_src, $dbh_dst) = @_;
+    my ($scoln, $scolt) = column_info($dbh_src, $table);
+    my ($dcoln, $dcolt) = column_info($dbh_dst, lc($table));
+    my ($s_nrows) = $dbh_src->selectrow_array("SELECT count(*) FROM $table");
+    my $ncols = @$dcoln;
+    my $slist = join(',', sort keys %$scolt);
+    my $dlist = join(',', sort keys %$dcolt);
+    if ( $slist ne $dlist )
+    {
+	die qq|\nerror: columns of "$table" on source and destination differs!\n|
+		.qq|src: $slist\ndst: $dlist\n|;
+    }
+    my $attachments = lc($table) eq 'attachments';
+    $verbose < 2 || print "\n\tbegin work on dest\n\n";
+    $dbh_dst->begin_work();
+    my ($att_cont_idx, $att_contenc_idx, $att_conttype_idx, $att_filename);
+    if ( $attachments )
+    {
+	for(my $i = 0; $i < @$dcoln; $i++)
+	{
+	    $att_cont_idx = $i if $dcoln->[$i] eq 'content';
+	    $att_contenc_idx = $i if $dcoln->[$i] eq 'contentencoding';
+	    $att_conttype_idx = $i if $dcoln->[$i] eq 'contenttype';
+	    $att_filename = $i if $dcoln->[$i] eq 'filename';
+	}
+    }
+    my $chunked = $scolt->{'id'}{'type_name'} eq 'int' ? 1 : 0;
+    my ($id_min, $id_max) = (0, 1);
+    my ($id_step) = 100;
+    if ( $chunked )
+    {
+	($id_min, $id_max) = $dbh_src->selectrow_array("SELECT min(id), max(id) FROM $table");
+    }
+    my $c_sel = "SELECT " . join(',', @$dcoln) . " FROM $table";
+    $c_sel .= " WHERE id >= ? AND id <= ?" if $chunked;
+    $verbose < 2 || print "\n\texecuting on source:\n\t$c_sel\n";
+    my @colattr = map {
+	    $dcolt->{$_}{'type_name'} eq 'bytea' ? { pg_type => PG_BYTEA } : undef;
+	} @$dcoln;
+    my $c_ins = "INSERT INTO $table ("
+	    . join(',', @$dcoln)
+	    . ") VALUES ("
+	    . ( join(',', ('?') x @$dcoln) )
+	    . ")";
+    my $sth_dst = $dbh_dst->prepare($c_ins);
+    $verbose < 2 || print "\n\texecuting on dest:\n\t$c_ins\n\n";
+    my $sth_src = $dbh_src->prepare($c_sel);
+    my $n = 0;
+    for(my $id_low = $id_min; $id_low <= $id_max; $id_low+=$id_step)
+    {
+	$sth_src->execute($chunked ? ($id_low, $id_low + $id_step -1) : ());
+	while ( my $ar = $sth_src->fetchrow_arrayref() )
+	{
+	    $verbose < 3 || print Data::Dumper->Dump([$ar], [qw(values)]);
+	    unless ( $dryrun ) {
+		if ( $attachments
+			&& ( $ar->[$att_contenc_idx] eq 'none'
+			    || $ar->[$att_contenc_idx] eq '' ) )
+		{
+		    my $eb64 = 0;
+		    unless ( $ar->[$att_conttype_idx] =~ m{^[-.a-z0-9]+/[-.a-z0-9]+} )
+		    {
+			$_ = conttype_guess($ar->[$att_cont_idx]);
+			$ar->[$att_conttype_idx] = $_ if $_;
+		    }
+		    if ( $ar->[$att_conttype_idx] =~ m/^(application|image)/i
+			    || $ar->[$att_filename] =~ m/\.(?:arj|asc|avi|bmp|bz2|cdr|cer|crl|dat|dbf|der|exe|docx?|gif|gz|jar|jpg|od[st]|p12|pcap|pcf|pcx|pdf|pfx|png|ppt|tbz|tgz|tiff?|ttf|wav|wm[va]|xlsx?|zip)$/i )
+		    {
+			$eb64 = 1;
+		    }
+		    else
+		    {
+			eval { Encode::decode('utf-8', $ar->[$att_cont_idx], Encode::FB_CROAK | Encode::LEAVE_SRC); };
+			if ( $@ )
+			{
+			    my $conttype_guess = conttype_guess($ar->[$att_cont_idx]);
+			    if ( $ar->[$att_conttype_idx] =~ m/^text\b/i
+				&& $conttype_guess =~ m/^text\b/i )
+			    {
+				$eb64 = 1 if utf8_fix($ar->[$att_cont_idx]) < 0;
+			    }
+			    else
+			    {
+#				$ar->[$att_conttype_idx] = $conttype_guess;
+				$eb64 = 1;
+			    }
+			}
+		    }
+		    if ( $eb64 )
+		    {
+			$ar->[$att_contenc_idx] = 'base64';
+			$ar->[$att_cont_idx] = encode_base64($ar->[$att_cont_idx]);
+		    }
+		}
+		for(my $i = 0; $i < $ncols; $i++)
+		{
+		    $sth_dst->bind_param($i +1, $ar->[$i], $colattr[$i]);
+		}
+		eval { $sth_dst->execute(); };
+		die $@ if $@;
+	    };
+	    $n++;
+	}
+	if ( $verbose )
+	{
+	    my $msg = "; $n/$s_nrows rec";
+	    print($msg, ("\b" x length($msg)));
+	}
+    }
+    $n == $s_nrows
+	    || die qq|error: $n rows copied, but source contains $s_nrows!\n|;
+    $verbose < 2 || print "\n\tcommit on dest\n\n";
+    $dbh_dst->commit();
+    return $n;
+}
+
+sub copy_everything
+{
+    my ($dbh_src, $dbh_dst) = @_;
+    my @stabs = @{user_tables($dbh_src)};
+    my @dtabs = @{user_tables($dbh_dst)};
+    my @tabs = @stabs;
+    foreach my $t (@dtabs)
+    {
+	push @tabs, $t unless grep(lc($_) eq lc($t), @stabs);
+    }
+    foreach my $table (@tabs)
+    {
+	if ( !grep(lc($_) eq lc($table), @dtabs) )
+	{
+	    warn qq|warn: skipping table "$table" not existing on destination\n|;
+	    next;
+	}
+	if ( !grep(lc($_) eq lc($table), @stabs) )
+	{
+	    warn qq|warn: skipping table "$table" not existing on source\n|;
+	    next;
+	}
+	$verbose && print "tab: $table: ";
+	$dryrun || $dbh_dst->do("DELETE FROM $table");
+	$verbose && print "del";
+	my $n = copy_table($table, $dbh_src, $dbh_dst);
+	$verbose && print "; $n records copied";
+	$verbose && print "\n";
+    }
+    my $user_seqs = user_seqs($dbh_dst);
+    foreach my $seq (@$user_seqs)
+    {
+	$verbose && print "seq: $seq: ";
+	my $table = $seq;
+	$table =~ s/_id_s(?:eq)?$//;
+	$dbh_dst->do("SELECT setval('$seq', (SELECT max(id) FROM $table)+1)");
+	$verbose && print "updated\n";
+    }
+}
+
+sub rm_fulltext
+{
+    my ($dbh_dst) = @_;
+
+    my ($attidx_exists) = $dbh_dst->selectrow_array(q{SELECT * FROM pg_indexes
+	    WHERE schemaname='public'
+		    AND tablename='attachments'
+		    AND indexname='attachments_textsearch'});
+    if ( $attidx_exists )
+    {
+	$verbose && print "index attachments_textsearch: ";
+	$dryrun || $dbh_dst->do('DROP INDEX attachments_textsearch');
+	$verbose && print "dropped\n";
+    }
+
+    my ($ocfvidx_exists) = $dbh_dst->selectrow_array(q{SELECT * FROM pg_indexes
+	    WHERE schemaname='public'
+		    AND tablename='objectcustomfieldvalues'
+		    AND indexname='largecontent_textsearch'});
+    if ( $ocfvidx_exists )
+    {
+	$verbose && print "index largecontent_textsearch: ";
+	$dryrun || $dbh_dst->do('DROP INDEX largecontent_textsearch');
+	$verbose && print "dropped\n";
+    }
+
+    my ($rel_att_id) = $dbh_dst->selectrow_array(
+	    q{SELECT relfilenode FROM pg_class WHERE relname='attachments'});
+    my ($rel_ocfv_id) = $dbh_dst->selectrow_array(
+	    q{SELECT relfilenode FROM pg_class WHERE relname='objectcustomfieldvalues'});
+
+    my ($trig_att_exist) = $dbh_dst->selectrow_array(qq{SELECT EXISTS (
+	    SELECT * FROM pg_trigger WHERE tgrelid=$rel_att_id AND tgname='tsvectorupdate')});
+    if ( $trig_att_exist )
+    {
+	$verbose && print "trigger tsvectorupdate on attachments: ";
+	$dryrun || $dbh_dst->do('DROP TRIGGER tsvectorupdate ON attachments');
+	$verbose && print "dropped\n";
+    }
+
+    my ($trig_ocfv_exist) = $dbh_dst->selectrow_array(qq{SELECT EXISTS (
+	    SELECT * FROM pg_trigger WHERE tgrelid=$rel_ocfv_id AND tgname='tsvectorupdate')});
+    if ( $trig_ocfv_exist )
+    {
+	$verbose && print "trigger tsvectorupdate on objectcustomfieldvalues: ";
+	$dryrun || $dbh_dst->do('DROP TRIGGER tsvectorupdate ON objectcustomfieldvalues');
+	$verbose && print "dropped\n";
+    }
+
+    my ($dcoln, $dcolt) = column_info($dbh_dst, 'attachments');
+    if ( grep( $_ eq $tsvector_column, @$dcoln ) )
+    {
+	$verbose && print "column attachments.$tsvector_column: ";
+	$dryrun || $dbh_dst->do("ALTER TABLE attachments DROP COLUMN $tsvector_column");
+	$verbose && print "dropped\n";
+    }
+
+    my ($dcoln, $dcolt) = column_info($dbh_dst, 'objectcustomfieldvalues');
+    if ( grep( $_ eq $tsvector_column, @$dcoln ) )
+    {
+	$verbose && print "column objectcustomfieldvalues.$tsvector_column: ";
+	$dryrun || $dbh_dst->do("ALTER TABLE objectcustomfieldvalues DROP COLUMN $tsvector_column");
+	$verbose && print "dropped\n";
+    }
+}
+
+sub create_lang
+{
+    my ($dbh_dst, $lanname) = @_;
+
+    my ($lang_exists) = $dbh_dst->selectrow_array(
+	    qq|SELECT EXISTS (SELECT * FROM pg_language WHERE lanname='$lanname')|);
+    $verbose && print "language $lanname: ";
+    if ( $lang_exists )
+    {
+	$verbose && print "already exists\n";
+    }
+    else
+    {
+	$dryrun || $dbh_dst->do("CREATE LANGUAGE $lanname");
+	$verbose && print "created\n";
+    }
+}
+
+sub create_func
+{
+    my ($dbh_dst, $stmt) = @_;
+
+    $stmt =~ m/^ \s* CREATE \s+ (?: OR \s+ REPLACE \s+ )? FUNCTION \s+ ([^()[:space:]]+) /xi
+	    || die qq|create_func: called with strange statement: `$stmt'\n|;
+    my $funcname = $1;
+    $verbose && print "function $funcname: ";
+    $dryrun || $dbh_dst->do($stmt);
+    $verbose && print "redefined\n";
+}
+
+sub create_trig
+{
+    my ($dbh_dst, $stmt) = @_;
+
+    $stmt =~ m/^ \s* CREATE \s+ TRIGGER \s+ (\S+) \s+ (?: BEFORE | AFTER )
+		\s+ \S+ \s+ (?: OR \s+ \S+ \s+ )* ON \s+ (\S+) /xi
+	    || die qq|create_trig: called with strange statement: `$stmt'\n|;
+    my $trig_name = $1;
+    my $tabl_name = $2;
+    $verbose && print "trigger $trig_name on $tabl_name: ";
+    $dryrun || $dbh_dst->do($stmt);
+    $verbose && print "created\n";
+}
+
+sub create_index
+{
+    my ($dbh_dst, $stmt) = @_;
+
+    $stmt =~ m/^ \s* CREATE \s+ INDEX \s+ (\S+) /xi
+	    || die qq|create_index: called with strange statement: `$stmt'\n|;
+    my $index_name = $1;
+    $verbose && print "index $index_name: ";
+    $dryrun || $dbh_dst->do($stmt);
+    $verbose && print "created\n";
+}
+
+sub setup_fulltext
+{
+    my ($dbh_dst) = @_;
+
+    my $dbname = $dbh_dst->{'Name'};
+    $dbname =~ s/.*\bdbname=([^;]+).*/$1/;
+
+    create_lang($dbh_dst, 'plpgsql');
+    create_lang($dbh_dst, 'plperl');
+    create_lang($dbh_dst, 'plperlu');
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION text_to_trigrams(text) RETURNS text[] AS $$
+    $_ = lc($_[0]);
+    my %trgms;
+
+    pos = 0;
+    while ( ! m/\G$/sgc )
+    {
+	next if m/\G\s+/sgc;
+	next if m/\G\n/sgc;
+	my ($token) = m/\G(\S+)/sgc;
+	for(my $i = 0; $i < length($token) -2; $i++)
+	{
+	    $trgms{substr($token, $i, 3)} = 1;
+	}
+    }
+    return [ map {
+	    unless ( m/^[[:word:]]+$/ )
+	    {
+		s/\\/\\\\/g;
+		s/'/''/g;
+		$_ = "'$_'";
+	    }
+	    $_;
+	} keys %trgms ];
+$$ LANGUAGE plperlu IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION array_to_trigrams(text[]) RETURNS text[] AS $$
+    use utf8;
+
+    my ($t) = lc($_[0]);
+    my %trgms;
+    my @ta;
+    $t =~ m/^\{/gc || die q|text_to_trigrams: input invalid at |
+	    . pos($t) . ': `' . substr($t, pos($t), 16) . q|'\n|;
+    while ( 1 )
+    {
+	if ( $t =~ m/\G"/gc )
+	{
+	    $t =~ m/\G((?:(?:\\\\)*(?:\\")*[^"\\]*)*)/gc;
+	    push @ta, $1;
+	    $t =~ m/\G"/gc || die q|text_to_trigrams: input invalid at |
+		    . pos($t) . ': `' . substr($t, pos($t), 16) . q|'\n|;
+	}
+	elsif ( $t =~ m/\G([^,}]*)/gc )
+	{
+	    push @ta, $1;
+	}
+	$t =~ m/\G,/gc && next;
+	$t =~ m/\G\}/gc && last;
+	die q|text_to_trigrams: input invalid at |
+		. pos($t) . ': `' . substr($t, pos($t), 16) . q|'\n|;
+    }
+    foreach ( @ta )
+    {
+	next if $_ eq 'NULL';
+	s/\\(\d{1,3})/chr(oct($1))/ge;
+	s/\\x([[:xdigit:]]{1,2})/chr(hex($1))/ge;
+	s/\\b/\b/ge;
+	s/\\f/\f/ge;
+	s/\\n/\n/ge;
+	s/\\r/\r/ge;
+	s/\\t/\t/ge;
+	s/\\(.)/$1/ge;
+
+	for(my $i = 0; $i < length($_) -2; $i++)
+	{
+	    $trgms{substr($_, $i, 3)} = 1;
+	}
+    }
+
+    return [ map {
+	    unless ( m/^[[:word:]]+$/ )
+	    {
+		s/\\/\\\\/g;
+		s/'/''/g;
+		$_ = "'$_'";
+	    }
+	    $_;
+	} keys %trgms ];
+$$ LANGUAGE plperlu IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION array_to_tsvector(text[]) RETURNS tsvector AS $$
+    SELECT array_to_string($1, ' ')::tsvector;
+$$ LANGUAGE SQL IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION array_to_tsquery(text[]) RETURNS tsquery AS $$
+    SELECT array_to_string($1, ' & ')::tsquery;
+$$ LANGUAGE SQL IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION text_to_trgm_tsvector(text) RETURNS tsvector AS $$
+    SELECT array_to_tsvector( text_to_trigrams( $1 ) )
+$$ LANGUAGE SQL IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<'EOF');
+CREATE OR REPLACE FUNCTION text_to_trgm_tsquery(text) RETURNS tsquery AS $$
+    SELECT array_to_tsquery( text_to_trigrams( $1 ) )
+$$ LANGUAGE SQL IMMUTABLE;
+EOF
+
+    create_func($dbh_dst, <<EOF);
+CREATE OR REPLACE FUNCTION attachments_trigger() RETURNS trigger AS \$\$
+BEGIN
+    new.$tsvector_column := text_to_trgm_tsvector(
+	    CASE WHEN new.contenttype LIKE 'text/%' AND (
+		    new.contentencoding IS NULL
+		    OR new.contentencoding = ''
+		    OR new.contentencoding = 'none'
+		    )
+		THEN coalesce(new.subject,'') || ' ' || coalesce(new.content,'')
+		ELSE coalesce(new.subject,'')
+	    END
+	);
+    RETURN new;
+END
+\$\$ LANGUAGE plpgsql
+EOF
+
+    create_func($dbh_dst, <<EOF);
+CREATE OR REPLACE FUNCTION objectcustomfieldvalues_trigger() RETURNS trigger AS \$\$
+BEGIN
+  new.$tsvector_column := text_to_trgm_tsvector(coalesce(new.largecontent, ''));
+  RETURN new;
+END
+\$\$ LANGUAGE plpgsql
+EOF
+
+    my ($dcoln, $dcolt) = column_info($dbh_dst, 'attachments');
+    $verbose && print "column attachments.$tsvector_column: ";
+    if ( grep( $_ eq $tsvector_column, @$dcoln ) )
+    {
+	$verbose && print "already exists\n";
+    }
+    else
+    {
+	$dryrun || $dbh_dst->do("ALTER TABLE attachments
+					ADD COLUMN $tsvector_column tsvector");
+	$verbose && print "added\n";
+    }
+
+    $verbose && print "column attachments.$tsvector_column: ";
+    $dryrun || $dbh_dst->do(<<EOF);
+UPDATE attachments
+    SET $tsvector_column = text_to_trgm_tsvector(
+	    CASE WHEN contenttype LIKE 'text/%' AND (
+		    contentencoding IS NULL
+		    OR contentencoding = ''
+		    OR contentencoding = 'none'
+		    )
+		THEN coalesce(subject,'') || ' ' || coalesce(content,'')
+		ELSE coalesce(subject,'')
+	    END
+	)
+EOF
+    $verbose && print "values updated\n";
+
+    my ($dcoln, $dcolt) = column_info($dbh_dst, 'objectcustomfieldvalues');
+    $verbose && print "column objectcustomfieldvalues.$tsvector_column: ";
+    if ( grep( $_ eq $tsvector_column, @$dcoln ) )
+    {
+	$verbose && print "already exists\n";
+    }
+    else
+    {
+	$dryrun || $dbh_dst->do("ALTER TABLE objectcustomfieldvalues
+					ADD COLUMN $tsvector_column tsvector");
+	$verbose && print "added\n";
+    }
+
+    $verbose && print "column objectcustomfieldvalues.$tsvector_column: ";
+    $dryrun || $dbh_dst->do(qq{UPDATE objectcustomfieldvalues SET $tsvector_column = text_to_trgm_tsvector(
+			coalesce(largecontent,''))});
+    $verbose && print "values updated\n";
+
+    create_index($dbh_dst, <<EOF);
+CREATE INDEX attachments_textsearch ON attachments USING GIN($tsvector_column)
+EOF
+
+    create_index($dbh_dst, <<EOF);
+CREATE INDEX largecontent_textsearch ON objectcustomfieldvalues USING GIN($tsvector_column)
+EOF
+
+    create_trig($dbh_dst, <<'EOF');
+CREATE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE
+	ON attachments FOR EACH ROW EXECUTE PROCEDURE attachments_trigger()
+EOF
+
+    create_trig($dbh_dst, <<'EOF');
+CREATE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE
+	ON objectcustomfieldvalues FOR EACH ROW EXECUTE PROCEDURE objectcustomfieldvalues_trigger()
+EOF
+
+}
+
+
+MAIN: {
+    $| = 1;
+    my ($usage, $copy, $fulltext, $vacuum);
+    my ($dbi_src_dsn, $dbi_src_user, $dbi_src_password);
+    my ($dbi_dst_dsn, $dbi_dst_user, $dbi_dst_password);
+
+    usage(1) unless Getopt::Long::GetOptions(
+	    'c|copy' => \$copy,
+	    'h|help' => \$usage,
+	    'v|verbose+' => \$verbose,
+	    'n|dry-run' => \$dryrun,
+	    'src-dsn=s' => \$dbi_src_dsn,
+	    'src-user=s' => \$dbi_src_user,
+	    'src-password=s' => \$dbi_src_password,
+	    'dst-dsn=s' => \$dbi_dst_dsn,
+	    'dst-user=s' => \$dbi_dst_user,
+	    'dst-password=s' => \$dbi_dst_password,
+	    'fulltext!' => \$fulltext,
+	    'vacuum' => \$vacuum);
+    usage(0) if $usage;
+    if ( @ARGV == 2 )
+    {
+	($dbi_src_dsn, $dbi_dst_dsn) = @ARGV;
+    }
+    elsif ( @ARGV )
+    {
+	usage(1);
+    }
+
+    my ($dbh_dst, $dbh_src);
+    if ( $dbi_dst_dsn )
+    {
+	$dbh_dst = DBI->connect($dbi_dst_dsn, $dbi_dst_user, $dbi_dst_password,
+			    { 'RaiseError' => 1, 'AutoCommit' => 1, } );
+	$dbh_dst->do("SET synchronous_commit TO off");
+    }
+    if ( $dbi_src_dsn )
+    {
+	$dbh_src = DBI->connect($dbi_src_dsn, $dbi_src_user, $dbi_src_password,
+			    { 'RaiseError' => 1, 'AutoCommit' => 1, });
+	$dbh_src->{'mysql_enable_utf8'} = 1;
+	$dbh_src->do("SET NAMES utf8");
+    }
+
+    $SIG{'__WARN__'} = sub {
+	    warn @_ unless $_[0] =~ m/^NOTICE:  word is too long to be indexed/;
+	};
+
+    SWITCH: {
+
+	$copy && do {
+	    die "error: destination DSN not set! (see usage)\n" unless $dbh_dst;
+	    die "error: source DSN not set! (see usage)\n" unless $dbh_src;
+	    rm_fulltext($dbh_dst);
+	    copy_everything($dbh_src, $dbh_dst);
+	    setup_fulltext($dbh_dst) if $fulltext;
+	    last SWITCH;
+	};
+
+	defined $fulltext && do {
+	    die "error: destination DSN not set! (see usage)\n" unless $dbh_dst;
+	    if ( $fulltext )
+	    {
+		rm_fulltext($dbh_dst);
+		setup_fulltext($dbh_dst);
+	    }
+	    else
+	    {
+		rm_fulltext($dbh_dst);
+	    }
+	    last SWITCH;
+	};
+
+	warn "Nothing to do; see usage (-h)\n";
+    }
+
+    if ( $vacuum )
+    {
+	$verbose && print "vacuum: ";
+	$dryrun || $dbh_dst->do("VACUUM ANALYZE");
+	$verbose && print "done\n";
+    }
+
+    $dbh_dst->disconnect() if $dbh_dst;
+    $dbh_src->disconnect() if $dbh_src;
+}
